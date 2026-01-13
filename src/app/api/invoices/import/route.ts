@@ -1,91 +1,7 @@
 import { createClient } from '@/lib/supabase/server'
 import { NextRequest, NextResponse } from 'next/server'
-
-interface MiAdminRow {
-  UUID?: string
-  'UUID Fiscal'?: string
-  Tipo?: string
-  Fecha?: string
-  'RFC Emisor'?: string
-  'Nombre Emisor'?: string
-  'RFC Receptor'?: string
-  'Nombre Receptor'?: string
-  Subtotal?: string
-  IVA?: string
-  Total?: string
-  Concepto?: string
-  'Metodo Pago'?: string
-  'Forma Pago'?: string
-  [key: string]: string | undefined
-}
-
-function parseCSV(csvText: string): MiAdminRow[] {
-  const lines = csvText.trim().split('\n')
-  if (lines.length < 2) return []
-
-  // Parse header - handle quoted values
-  const headerLine = lines[0]
-  const headers = parseCSVLine(headerLine)
-
-  return lines.slice(1).map(line => {
-    const values = parseCSVLine(line)
-    const record: MiAdminRow = {}
-    headers.forEach((header, index) => {
-      record[header] = values[index] || ''
-    })
-    return record
-  }).filter(row => row.UUID || row['UUID Fiscal']) // Filter empty rows
-}
-
-function parseCSVLine(line: string): string[] {
-  const result: string[] = []
-  let current = ''
-  let inQuotes = false
-
-  for (let i = 0; i < line.length; i++) {
-    const char = line[i]
-
-    if (char === '"') {
-      inQuotes = !inQuotes
-    } else if (char === ',' && !inQuotes) {
-      result.push(current.trim())
-      current = ''
-    } else {
-      current += char
-    }
-  }
-  result.push(current.trim())
-
-  return result.map(v => v.replace(/^"|"$/g, ''))
-}
-
-function parseDate(dateStr: string): string {
-  if (!dateStr) return new Date().toISOString().split('T')[0]
-
-  // Handle DD/MM/YYYY format
-  if (dateStr.includes('/')) {
-    const parts = dateStr.split('/')
-    if (parts.length === 3) {
-      const [day, month, year] = parts
-      return `${year}-${month.padStart(2, '0')}-${day.padStart(2, '0')}`
-    }
-  }
-
-  // Handle YYYY-MM-DD format
-  if (/^\d{4}-\d{2}-\d{2}/.test(dateStr)) {
-    return dateStr.substring(0, 10)
-  }
-
-  return dateStr
-}
-
-function parseNumber(str: string | undefined): number {
-  if (!str) return 0
-  // Remove currency symbols, commas, spaces
-  const clean = str.replace(/[$,\s]/g, '')
-  const num = parseFloat(clean)
-  return isNaN(num) ? 0 : num
-}
+import { parseMiAdminExcel, detectFileType } from '@/lib/parsers/miadmin'
+import type { InvoiceType, ImportResult } from '@/types/invoice'
 
 export async function POST(request: NextRequest) {
   const supabase = await createClient()
@@ -98,93 +14,197 @@ export async function POST(request: NextRequest) {
   try {
     const formData = await request.formData()
     const file = formData.get('file') as File
+    const forcedType = formData.get('type') as InvoiceType | null
 
     if (!file) {
       return NextResponse.json({ error: 'No se proporcionó archivo' }, { status: 400 })
     }
 
-    // Accept CSV and TXT files
-    if (!file.name.endsWith('.csv') && !file.name.endsWith('.txt')) {
-      return NextResponse.json({ error: 'El archivo debe ser CSV' }, { status: 400 })
+    // Validar tipo de archivo
+    const fileName = file.name.toLowerCase()
+    const isExcel = fileName.endsWith('.xlsx') || fileName.endsWith('.xls')
+
+    if (!isExcel) {
+      return NextResponse.json({
+        error: 'Formato no soportado. Por favor sube un archivo Excel (.xlsx)'
+      }, { status: 400 })
     }
 
-    // Read CSV content
-    const csvText = await file.text()
-    const records = parseCSV(csvText)
-
-    if (records.length === 0) {
-      return NextResponse.json({ error: 'No se encontraron facturas en el archivo' }, { status: 400 })
+    // Validar tamaño (5MB max)
+    if (file.size > 5 * 1024 * 1024) {
+      return NextResponse.json({ error: 'El archivo excede el límite de 5MB' }, { status: 400 })
     }
 
-    // Transform to database format
-    const invoices = records.map((record) => {
-      const uuid = record.UUID || record['UUID Fiscal'] || ''
-      const fecha = parseDate(record.Fecha || '')
-      const period = fecha.substring(0, 7) // YYYY-MM
+    // Leer archivo
+    const buffer = await file.arrayBuffer()
 
-      // Determine type: emitida if user is emisor, recibida if user is receptor
-      let tipo = (record.Tipo || '').toLowerCase()
-      if (!tipo || (tipo !== 'emitida' && tipo !== 'recibida')) {
-        tipo = 'emitida' // Default
-      }
+    // Parsear Excel de MiAdmin
+    const parseResult = parseMiAdminExcel(buffer, file.name, forcedType || undefined)
 
-      return {
-        user_id: user.id,
-        uuid_fiscal: uuid,
-        type: tipo as 'emitida' | 'recibida',
-        fecha: fecha,
-        rfc_emisor: record['RFC Emisor'] || '',
-        nombre_emisor: record['Nombre Emisor'] || null,
-        rfc_receptor: record['RFC Receptor'] || '',
-        nombre_receptor: record['Nombre Receptor'] || null,
-        subtotal: parseNumber(record.Subtotal),
-        iva: parseNumber(record.IVA),
-        total: parseNumber(record.Total),
-        concepto: record.Concepto || null,
-        metodo_pago: record['Metodo Pago'] || null,
-        forma_pago: record['Forma Pago'] || null,
-        period: period,
-      }
-    }).filter(inv => inv.uuid_fiscal) // Filter out invalid records
-
-    if (invoices.length === 0) {
-      return NextResponse.json({ error: 'No se encontraron facturas válidas' }, { status: 400 })
+    if (!parseResult.success) {
+      return NextResponse.json({
+        error: 'Error al procesar archivo',
+        details: parseResult.errors,
+      }, { status: 400 })
     }
 
-    // Upsert invoices (handle duplicates via uuid_fiscal)
-    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    if (parseResult.invoices.length === 0) {
+      return NextResponse.json({
+        error: 'No se encontraron facturas válidas en el archivo',
+        warnings: parseResult.warnings,
+      }, { status: 400 })
+    }
+
+    // Preparar datos para insertar
+    const invoicesToInsert = parseResult.invoices.map(inv => ({
+      user_id: user.id,
+      uuid_fiscal: inv.uuid_fiscal,
+      type: inv.type,
+      invoice_type: inv.invoice_type,
+      status: inv.status,
+      fecha: inv.fecha,
+      stamp_date: inv.stamp_date,
+      rfc_emisor: inv.rfc_emisor,
+      nombre_emisor: inv.nombre_emisor,
+      rfc_receptor: inv.rfc_receptor,
+      nombre_receptor: inv.nombre_receptor,
+      subtotal: inv.subtotal,
+      discount: inv.discount,
+      total: inv.total,
+      iva: inv.iva,
+      iva_16: inv.iva_16,
+      iva_8: inv.iva_8,
+      ieps_total: inv.ieps_total,
+      retained_iva: inv.retained_iva,
+      retained_isr: inv.retained_isr,
+      forma_pago: inv.forma_pago,
+      metodo_pago: inv.metodo_pago,
+      currency: inv.currency,
+      exchange_rate: inv.exchange_rate,
+      concepto: inv.concepto,
+      cfdi_use: inv.cfdi_use,
+      period: inv.period,
+      fiscal_year: inv.fiscal_year,
+      fiscal_month: inv.fiscal_month,
+      raw_data: inv.raw_data,
+    }))
+
+    // Upsert facturas (actualizar si ya existe por UUID)
     const { data, error } = await supabase
       .from('invoices')
-      .upsert(invoices as any, {
+      .upsert(invoicesToInsert, {
         onConflict: 'user_id,uuid_fiscal',
         ignoreDuplicates: false,
       })
-      .select()
+      .select('id')
 
     if (error) {
       console.error('Import error:', error)
       return NextResponse.json({
-        error: 'Error al importar facturas',
-        details: error.message
+        error: 'Error al guardar facturas',
+        details: error.message,
       }, { status: 500 })
     }
 
-    // Count by type
-    const emitidas = invoices.filter(i => i.type === 'emitida').length
-    const recibidas = invoices.filter(i => i.type === 'recibida').length
+    // Calcular estadísticas
+    const inserted = data?.length || 0
+    const vigentes = parseResult.invoices.filter(i => i.status === 'vigente').length
+    const canceladas = parseResult.invoices.filter(i => i.status === 'cancelado').length
+
+    const result: ImportResult = {
+      success: true,
+      type: parseResult.type,
+      period: parseResult.period,
+      fileName: file.name,
+      total: parseResult.invoices.length,
+      inserted,
+      updated: parseResult.invoices.length - inserted,
+      skipped: parseResult.warnings.length,
+      errors: parseResult.errors,
+    }
 
     return NextResponse.json({
-      success: true,
-      imported: data?.length || invoices.length,
-      total: records.length,
-      emitidas,
-      recibidas,
+      ...result,
+      vigentes,
+      canceladas,
+      warnings: parseResult.warnings.slice(0, 10), // Limitar warnings
     })
 
   } catch (error) {
     console.error('Import error:', error)
     return NextResponse.json({
-      error: error instanceof Error ? error.message : 'Error interno'
+      error: error instanceof Error ? error.message : 'Error interno',
+    }, { status: 500 })
+  }
+}
+
+// GET para obtener resumen de facturas
+export async function GET(request: NextRequest) {
+  const supabase = await createClient()
+
+  const { data: { user }, error: authError } = await supabase.auth.getUser()
+  if (authError || !user) {
+    return NextResponse.json({ error: 'No autorizado' }, { status: 401 })
+  }
+
+  const { searchParams } = new URL(request.url)
+  const period = searchParams.get('period') // YYYY-MM
+  const type = searchParams.get('type') as InvoiceType | null
+
+  try {
+    let query = supabase
+      .from('invoices')
+      .select('*')
+      .eq('user_id', user.id)
+      .eq('status', 'vigente')
+      .order('fecha', { ascending: false })
+
+    if (period) {
+      query = query.eq('period', period)
+    }
+
+    if (type) {
+      query = query.eq('type', type)
+    }
+
+    const { data, error } = await query
+
+    if (error) {
+      throw error
+    }
+
+    // Calcular totales - usar tipo genérico para evitar problemas con columnas nuevas
+    const invoices = (data || []) as Array<Record<string, unknown>>
+    const emitidas = invoices.filter(i => i.type === 'emitida')
+    const recibidas = invoices.filter(i => i.type === 'recibida')
+
+    const summary = {
+      total: invoices.length,
+      emitidas: {
+        count: emitidas.length,
+        subtotal: emitidas.reduce((sum, i) => sum + Number(i.subtotal || 0), 0),
+        iva: emitidas.reduce((sum, i) => sum + Number(i.iva || 0), 0),
+        total: emitidas.reduce((sum, i) => sum + Number(i.total || 0), 0),
+        retainedIva: emitidas.reduce((sum, i) => sum + Number(i.retained_iva || 0), 0),
+        retainedIsr: emitidas.reduce((sum, i) => sum + Number(i.retained_isr || 0), 0),
+      },
+      recibidas: {
+        count: recibidas.length,
+        subtotal: recibidas.reduce((sum, i) => sum + Number(i.subtotal || 0), 0),
+        iva: recibidas.reduce((sum, i) => sum + Number(i.iva || 0), 0),
+        total: recibidas.reduce((sum, i) => sum + Number(i.total || 0), 0),
+      },
+    }
+
+    return NextResponse.json({
+      invoices,
+      summary,
+    })
+
+  } catch (error) {
+    console.error('Get invoices error:', error)
+    return NextResponse.json({
+      error: error instanceof Error ? error.message : 'Error interno',
     }, { status: 500 })
   }
 }
