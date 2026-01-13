@@ -1,21 +1,11 @@
 import "jsr:@supabase/functions-js/edge-runtime.d.ts"
 import { createClient } from "npm:@supabase/supabase-js@2"
-import Anthropic from "npm:@anthropic-ai/sdk"
 
 const corsHeaders = {
   'Access-Control-Allow-Origin': '*',
   'Access-Control-Allow-Methods': 'POST, OPTIONS',
   'Access-Control-Allow-Headers': 'authorization, x-client-info, apikey, content-type',
 }
-
-const supabase = createClient(
-  Deno.env.get('SUPABASE_URL')!,
-  Deno.env.get('SUPABASE_SERVICE_ROLE_KEY')!
-)
-
-const anthropic = new Anthropic({
-  apiKey: Deno.env.get('ANTHROPIC_API_KEY')!,
-})
 
 const EXTRACTION_PROMPT = `Analiza este estado de cuenta bancario mexicano y extrae la informacion en formato JSON.
 
@@ -82,65 +72,135 @@ Responde SOLO con JSON valido, sin markdown ni explicaciones:
   ]
 }`
 
+// NO inicializar clientes en scope global - usar lazy init
+
 Deno.serve(async (req: Request) => {
-  // Handle CORS preflight
+  console.log('Edge Function invoked:', req.method)
+
   if (req.method === 'OPTIONS') {
     return new Response('ok', { headers: corsHeaders })
   }
 
   try {
-    const { statementId, fileUrl, userId } = await req.json()
+    // 1. Verificar environment variables primero
+    const supabaseUrl = Deno.env.get('SUPABASE_URL')
+    const supabaseKey = Deno.env.get('SUPABASE_SERVICE_ROLE_KEY')
+    const anthropicKey = Deno.env.get('ANTHROPIC_API_KEY')
 
-    if (!statementId || !fileUrl) {
-      throw new Error('Missing required parameters: statementId and fileUrl')
+    console.log('Environment check:', {
+      hasSupabaseUrl: !!supabaseUrl,
+      hasSupabaseKey: !!supabaseKey,
+      hasAnthropicKey: !!anthropicKey,
+      anthropicKeyPrefix: anthropicKey?.substring(0, 10) || 'NOT SET'
+    })
+
+    if (!supabaseUrl || !supabaseKey) {
+      throw new Error('Missing Supabase environment variables')
     }
 
-    console.log(`Processing statement ${statementId} for user ${userId}`)
+    if (!anthropicKey) {
+      throw new Error('ANTHROPIC_API_KEY not configured in Supabase secrets')
+    }
 
-    // 1. Download PDF from Storage
-    const pdfResponse = await fetch(fileUrl)
+    // 2. Crear cliente Supabase DENTRO del handler
+    console.log('Creating Supabase client...')
+    const supabase = createClient(supabaseUrl, supabaseKey)
+    console.log('Supabase client created')
+
+    // 3. Importar Anthropic dinamicamente
+    console.log('Importing Anthropic SDK...')
+    const { default: Anthropic } = await import("npm:@anthropic-ai/sdk")
+    console.log('Anthropic SDK imported')
+
+    const anthropic = new Anthropic({ apiKey: anthropicKey })
+    console.log('Anthropic client created')
+
+    // 4. Parsear request
+    const body = await req.json()
+    console.log('Request body:', JSON.stringify(body))
+
+    const { statementId, filePath, fileUrl, userId } = body
+
+    // Compatibilidad: usar filePath si existe, sino fileUrl
+    const pathToUse = filePath || fileUrl
+    console.log('Path to use:', pathToUse)
+
+    if (!statementId || !pathToUse) {
+      throw new Error('Missing required parameters: statementId and filePath/fileUrl')
+    }
+
+    // 5. Verificar si es URL o path
+    let signedUrl: string
+    if (pathToUse.startsWith('http')) {
+      console.log('Received a URL, using directly (legacy mode)')
+      signedUrl = pathToUse
+    } else {
+      console.log('Received a path, generating fresh signed URL')
+      const { data: urlData, error: urlError } = await supabase.storage
+        .from('bank-statements')
+        .createSignedUrl(pathToUse, 3600)
+
+      if (urlError || !urlData?.signedUrl) {
+        console.error('Signed URL error:', urlError)
+        throw new Error(`Failed to generate signed URL: ${urlError?.message}`)
+      }
+      signedUrl = urlData.signedUrl
+      console.log('Fresh signed URL generated')
+    }
+
+    // 6. Descargar PDF
+    console.log('Downloading PDF...')
+    const pdfResponse = await fetch(signedUrl)
     if (!pdfResponse.ok) {
-      throw new Error(`Failed to download PDF: ${pdfResponse.status}`)
+      throw new Error(`Failed to download PDF: ${pdfResponse.status} ${pdfResponse.statusText}`)
     }
 
     const pdfBuffer = await pdfResponse.arrayBuffer()
-    const pdfBase64 = btoa(String.fromCharCode(...new Uint8Array(pdfBuffer)))
-
     console.log(`PDF downloaded, size: ${pdfBuffer.byteLength} bytes`)
 
-    // 2. Call Claude API with Vision
+    // 7. Convertir a base64
+    console.log('Converting to base64...')
+    const bytes = new Uint8Array(pdfBuffer)
+    let binary = ''
+    const chunkSize = 8192
+    for (let i = 0; i < bytes.length; i += chunkSize) {
+      const chunk = bytes.subarray(i, i + chunkSize)
+      binary += String.fromCharCode.apply(null, Array.from(chunk))
+    }
+    const pdfBase64 = btoa(binary)
+    console.log(`Base64 encoded, length: ${pdfBase64.length}`)
+
+    // 8. Llamar Claude Vision
+    console.log('Calling Claude API...')
     const message = await anthropic.messages.create({
       model: "claude-sonnet-4-20250514",
       max_tokens: 16384,
-      messages: [
-        {
-          role: "user",
-          content: [
-            {
-              type: "document",
-              source: {
-                type: "base64",
-                media_type: "application/pdf",
-                data: pdfBase64,
-              },
+      messages: [{
+        role: "user",
+        content: [
+          {
+            type: "document",
+            source: {
+              type: "base64",
+              media_type: "application/pdf",
+              data: pdfBase64,
             },
-            {
-              type: "text",
-              text: EXTRACTION_PROMPT
-            }
-          ],
-        }
-      ],
+          },
+          {
+            type: "text",
+            text: EXTRACTION_PROMPT
+          }
+        ],
+      }],
     })
 
     console.log('Claude API response received')
 
-    // 3. Parse Claude's response
+    // 9. Parsear respuesta
     const responseText = message.content[0].type === 'text'
       ? message.content[0].text
       : ''
 
-    // Clean JSON (remove markdown code blocks if present)
     const cleanJson = responseText
       .replace(/```json\n?/g, '')
       .replace(/```\n?/g, '')
@@ -156,12 +216,11 @@ Deno.serve(async (req: Request) => {
 
     console.log(`Detected bank: ${extractedData.bank_detected}, transactions: ${extractedData.transactions?.length || 0}`)
 
-    // 4. Get or create bank_id from detected bank name
+    // 10. Get or create bank_id
     let bankId = null
     const bankName = extractedData.bank_detected
 
     if (bankName && bankName !== 'Unknown') {
-      // Try to find existing bank
       const { data: existingBank } = await supabase
         .from('banks')
         .select('id')
@@ -171,7 +230,6 @@ Deno.serve(async (req: Request) => {
       if (existingBank) {
         bankId = existingBank.id
       } else {
-        // Create new bank entry
         const { data: newBank } = await supabase
           .from('banks')
           .insert({ name: bankName })
@@ -184,7 +242,7 @@ Deno.serve(async (req: Request) => {
 
     const period = `${extractedData.period.year}-${String(extractedData.period.month).padStart(2, '0')}`
 
-    // 5. Update bank_statement with detected info
+    // 11. Update bank_statement
     const { error: updateError } = await supabase
       .from('bank_statements')
       .update({
@@ -200,15 +258,13 @@ Deno.serve(async (req: Request) => {
       throw new Error(`Failed to update statement: ${updateError.message}`)
     }
 
-    // 6. Insert transactions (filter out informational rows)
+    // 12. Insert transactions
     if (extractedData.transactions && extractedData.transactions.length > 0) {
       const validTransactions = extractedData.transactions.filter((tx: any) => {
-        // Filter out non-monetary entries
         const desc = (tx.description || '').toUpperCase()
         if (desc.includes('EXENCION') || desc.includes('SALDO ANTERIOR')) {
           return false
         }
-        // Must have a valid amount
         return tx.amount && tx.amount > 0
       })
 
@@ -253,19 +309,25 @@ Deno.serve(async (req: Request) => {
     )
 
   } catch (error) {
-    console.error('Error processing statement:', error)
+    console.error('Error processing statement:', error.message)
+    console.error('Error stack:', error.stack)
 
     // Try to update statement status to error
     try {
-      const body = await req.clone().json().catch(() => ({}))
-      if (body.statementId) {
-        await supabase
-          .from('bank_statements')
-          .update({
-            status: 'error',
-            error_message: error.message,
-          })
-          .eq('id', body.statementId)
+      const supabaseUrl = Deno.env.get('SUPABASE_URL')
+      const supabaseKey = Deno.env.get('SUPABASE_SERVICE_ROLE_KEY')
+      if (supabaseUrl && supabaseKey) {
+        const supabase = createClient(supabaseUrl, supabaseKey)
+        const body = await req.clone().json().catch(() => ({}))
+        if (body.statementId) {
+          await supabase
+            .from('bank_statements')
+            .update({
+              status: 'error',
+              error_message: error.message || 'Unknown error',
+            })
+            .eq('id', body.statementId)
+        }
       }
     } catch (updateError) {
       console.error('Failed to update error status:', updateError)
@@ -274,7 +336,7 @@ Deno.serve(async (req: Request) => {
     return new Response(
       JSON.stringify({
         success: false,
-        error: error.message
+        error: error.message || 'Unknown error'
       }),
       {
         status: 500,

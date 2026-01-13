@@ -46,12 +46,8 @@ export async function POST(request: NextRequest) {
       return NextResponse.json({ error: 'Error al subir archivo' }, { status: 500 })
     }
 
-    // Get public URL (signed for private bucket)
-    const { data: urlData } = await supabase.storage
-      .from('bank-statements')
-      .createSignedUrl(filename, 3600) // 1 hour expiry
-
-    const fileUrl = urlData?.signedUrl || ''
+    // Store the file path (not signed URL) - Edge Function will generate fresh URL
+    const filePath = filename
 
     // Create bank_statement record with 'pending' status
     const { data: statement, error: insertError } = await supabase
@@ -60,7 +56,7 @@ export async function POST(request: NextRequest) {
         user_id: user.id,
         bank_id: null, // Will be detected by Edge Function
         period: 'pending', // Will be extracted by Edge Function
-        file_url: fileUrl,
+        file_url: filePath, // Store path, not signed URL
         status: 'pending',
       })
       .select()
@@ -76,8 +72,7 @@ export async function POST(request: NextRequest) {
     return NextResponse.json({
       success: true,
       statementId: statement.id,
-      fileUrl: fileUrl,
-      filename: filename,
+      filePath: filePath,
     })
 
   } catch (error) {

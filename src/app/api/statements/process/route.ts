@@ -47,11 +47,11 @@ export async function POST(request: NextRequest) {
       .update({ status: 'processing' })
       .eq('id', statementId)
 
-    // Invoke Edge Function
+    // Invoke Edge Function - send filePath (not signed URL)
     const { data, error } = await supabase.functions.invoke('parse-bank-statement', {
       body: {
         statementId: statement.id,
-        fileUrl: statement.file_url,
+        filePath: statement.file_url, // file_url now stores the path, not a signed URL
         userId: user.id,
       },
     })
