@@ -1,6 +1,7 @@
 'use client'
 
 import { useState, useEffect, useCallback } from 'react'
+import { useRouter } from 'next/navigation'
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from '@/components/ui/card'
 import { Button } from '@/components/ui/button'
 import { Badge } from '@/components/ui/badge'
@@ -35,6 +36,7 @@ const statusConfig = {
 }
 
 export default function StatementsPage() {
+  const router = useRouter()
   const [isDragging, setIsDragging] = useState(false)
   const [isUploading, setIsUploading] = useState(false)
   const [uploadError, setUploadError] = useState<string | null>(null)
@@ -394,7 +396,11 @@ export default function StatementsPage() {
                           </Button>
                         )}
                         {statement.status === 'completed' && (
-                          <Button variant="ghost" size="sm">
+                          <Button
+                            variant="ghost"
+                            size="sm"
+                            onClick={() => router.push(`/statements/${statement.id}`)}
+                          >
                             Ver detalles
                           </Button>
                         )}
